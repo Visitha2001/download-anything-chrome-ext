@@ -389,13 +389,15 @@ function renderList(listId, items, label) {
         // Manual items from social platforms have CDN URLs that require auth cookies
         // the extension doesn't have — direct downloads always fail (saves .txt garbage)
         const AUTH_PLATFORMS = new Set(['YouTube', 'Facebook', 'Instagram', 'TikTok', 'Twitter/X', 'Twitch']);
-        const needsYtdlp = item.isStream
+        const needsYtdlp = item.quality !== 'API Direct' && (
+            item.isStream
             || item.url.includes('.m3u8')
             || item.url.includes('bytestart=')
             || item.platform === 'YouTube'
             || item.url.includes('youtube.com')
             || isWebPageUrl(item.url)
-            || (item.isManual && AUTH_PLATFORMS.has(item.platform));
+            || (item.isManual && AUTH_PLATFORMS.has(item.platform))
+        );
         const canDownload = !needsYtdlp;
 
         if (canDownload) {
@@ -418,28 +420,82 @@ function renderList(listId, items, label) {
             actions.appendChild(copyBtn);
             actions.appendChild(dlBtn);
         } else {
+            // New logic: Use third party API directly for video downloading
+            const apiBtn = document.createElement('button');
+            apiBtn.className = 'download-btn';
+            apiBtn.textContent = '⬇ API Download';
+            apiBtn.onclick = async () => {
+                const targetUrl = item.pageUrl || item.url;
+                const originalText = apiBtn.textContent;
+                apiBtn.textContent = '⏳ Fetching...';
+                apiBtn.disabled = true;
+                const instances = [
+                    'https://cobalt.cst.im/api/json',
+                    'https://cobalt-api.pepegapi.cc/api/json',
+                    'https://co.wuk.sh/api/json',
+                    'https://api.vkrdownloader.com/server?vkr=' // fallback to VKR
+                ];
+
+                let finalUrl = null;
+                for (let api of instances) {
+                    try {
+                        let data;
+                        if (api.includes('vkr')) {
+                            const res = await fetch(api + encodeURIComponent(targetUrl));
+                            data = await res.json();
+                            if (data && data.url) { finalUrl = data.url; break; }
+                        } else {
+                            const res = await fetch(api, {
+                                method: 'POST',
+                                headers: {
+                                    'Accept': 'application/json',
+                                    'Content-Type': 'application/json'
+                                },
+                                body: JSON.stringify({ url: targetUrl, videoQuality: '1080' })
+                            });
+                            data = await res.json();
+                            if (data && data.url) { finalUrl = data.url; break; }
+                        }
+                    } catch (e) {
+                        // silently try next
+                    }
+                }
+
+                if (finalUrl) {
+                    chrome.downloads.download({ url: finalUrl, saveAs: false });
+                    apiBtn.textContent = '✅ Started';
+                } else {
+                    apiBtn.textContent = '❌ Failed';
+                    // Open web downloader fallback
+                    if (item.platform === 'YouTube' || targetUrl.includes('youtube.com')) {
+                        window.open(`https://ssyoutube.com/en713/?url=${encodeURIComponent(targetUrl)}`, '_blank');
+                    } else if (item.platform === 'Facebook' || targetUrl.includes('facebook.com') || targetUrl.includes('fb.watch')) {
+                        window.open(`https://snapsave.app/?url=${encodeURIComponent(targetUrl)}`, '_blank');
+                    } else {
+                        alert('All free API endpoints failed. Please use the small "yt-dlp" fallback button instead.');
+                    }
+                }
+                setTimeout(() => { 
+                    apiBtn.textContent = originalText;
+                    apiBtn.disabled = false;
+                }, 3000);
+            };
+
             const ytBtn = document.createElement('button');
-            ytBtn.className   = 'ytdlp-btn';
-            ytBtn.title       = 'Copy yt-dlp command to clipboard';
-            ytBtn.textContent = 'yt-dlp Command';
+            ytBtn.className   = 'copy-btn';
+            ytBtn.title       = 'Copy yt-dlp command as fallback';
+            ytBtn.textContent = 'yt-dlp';
+            ytBtn.style.marginLeft = '5px';
             ytBtn.onclick = () => {
                 const targetUrl = item.pageUrl || item.url;
                 copyToClipboard(`yt-dlp "${targetUrl}"`);
-                ytBtn.textContent = 'Copied!';
-                setTimeout(() => { ytBtn.textContent = 'yt-dlp Command'; }, 1800);
-            };
-
-            const infoBtn = document.createElement('button');
-            infoBtn.className = 'download-btn';
-            infoBtn.style.backgroundColor = '#6b7280'; // gray
-            infoBtn.textContent = '❓ Why yt-dlp?';
-            infoBtn.onclick = () => {
-                alert('This video uses adaptive streaming (like YouTube) which splits audio and video, or it is a protected stream. It cannot be downloaded directly via the browser. Please install yt-dlp on your computer and use the copied command to download it.');
+                ytBtn.textContent = '✅';
+                setTimeout(() => { ytBtn.textContent = 'yt-dlp'; }, 1800);
             };
 
             actions.appendChild(copyBtn);
+            actions.appendChild(apiBtn);
             actions.appendChild(ytBtn);
-            actions.appendChild(infoBtn);
         }
 
         wrapper.appendChild(info);

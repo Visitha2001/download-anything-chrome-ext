@@ -378,259 +378,61 @@ async function extractMediaFromPastedUrl(targetTabId, rawUrl) {
     }
   }
 
-  // 2. Fetch page HTML in background (bypasses CORS via <all_urls>)
+  // 2. Fetch via Third-Party Free API (No Keys)
+  // Replaces all custom HTML parsing for YouTube, Facebook, TikTok, Reddit, etc.
   try {
-    const res = await fetch(url, {
-      headers: {
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,video/*;q=0.8,*/*;q=0.5',
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    const instances = [
+      'https://cobalt.cst.im/api/json',
+      'https://cobalt-api.pepegapi.cc/api/json',
+      'https://co.wuk.sh/api/json',
+      'https://api.vkrdownloader.com/server?vkr=' // fallback to VKR GET api
+    ];
+
+    let finalData = null;
+    for (let api of instances) {
+      try {
+        if (api.includes('vkr')) {
+            const res = await fetch(api + encodeURIComponent(url));
+            const data = await res.json();
+            if (data && data.url) { finalData = data; break; }
+        } else {
+            const res = await fetch(api, {
+              method: 'POST',
+              headers: {
+                'Accept': 'application/json',
+                'Content-Type': 'application/json',
+              },
+              body: JSON.stringify({ url: url })
+            });
+            const data = await res.json();
+            if (data && data.url) { finalData = data; break; }
+        }
+      } catch (e) {
+        // silently try next instance
       }
-    });
-
-    const contentType = res.headers.get('content-type') || '';
-
-    // If server responded with a direct video stream
-    if (contentType.startsWith('video/') || contentType.includes('mpegurl')) {
-      const cl = parseInt(res.headers.get('content-length') || '0', 10);
+    }
+    
+    if (finalData && finalData.url) {
       storeManualItem(targetTabId, {
-        url:       url,
+        url:       finalData.url,
         type:      'video',
-        mime:      contentType,
-        size:      cl,
-        title:     'Video Stream',
+        mime:      'video/mp4',
+        size:      0,
+        title:     'Detected Video (API)',
         poster:    '',
-        quality:   'Stream',
+        quality:   'API Direct',
         platform:  extractPlatform(url),
-        isStream:  url.includes('.m3u8'),
+        isStream:  data.url.includes('.m3u8'),
         isManual:  true,
         timestamp: Date.now(),
       });
       return { success: true, count: 1 };
     }
-
-    const html = await res.text();
-    let foundCount = 0;
-
-    // Helper to unescape JSON strings without corrupting URL percent-encoding
-    const unescapeJson = str => {
-      try {
-        return JSON.parse(`"${str}"`);
-      } catch {
-        return str.replace(/\\\//g, '/').replace(/\\u0026/g, '&');
-      }
-    };
-
-    // Extract title & poster from HTML
-    let pageTitle = '';
-    const titleMatch = html.match(/<meta\s+property=["']og:title["']\s+content=["']([^"']+)["']/i) ||
-                       html.match(/<title[^>]*>([^<]+)<\/title>/i);
-    if (titleMatch) pageTitle = titleMatch[1].trim();
-
-    let posterUrl = '';
-    const posterMatch = html.match(/<meta\s+property=["']og:image["']\s+content=["']([^"']+)["']/i) ||
-                        html.match(/<meta\s+name=["']twitter:image["']\s+content=["']([^"']+)["']/i);
-    if (posterMatch) posterUrl = posterMatch[1].replace(/&amp;/g, '&');
-
-    // ── Facebook Reel / Video extraction
-    if (url.includes('facebook.com') || url.includes('fb.watch')) {
-      const fbVideoRegexes = [
-        /"browser_native_hd_url"\s*:\s*"([^"]+)"/,
-        /"browser_native_sd_url"\s*:\s*"([^"]+)"/,
-        /"playable_url_quality_hd"\s*:\s*"([^"]+)"/,
-        /"playable_url"\s*:\s*"([^"]+)"/,
-        /"video_url"\s*:\s*"([^"]+)"/,
-      ];
-
-      for (const rx of fbVideoRegexes) {
-        const m = html.match(rx);
-        if (m && m[1]) {
-          const rawMediaUrl = unescapeJson(m[1]);
-          if (rawMediaUrl.startsWith('http') && !isWebPageUrl(rawMediaUrl)) {
-            const cleanUrl = cleanFacebookVideoUrl(rawMediaUrl);
-            const quality = rx.source.includes('hd') ? '1080p / HD' : 'SD';
-            storeManualItem(targetTabId, {
-              url:       cleanUrl,
-              type:      'video',
-              mime:      'video/mp4',
-              size:      0,
-              title:     pageTitle || 'Facebook Video',
-              poster:    posterUrl,
-              quality:   quality,
-              platform:  'Facebook',
-              isStream:  false,
-              isManual:  true,
-              timestamp: Date.now(),
-            });
-            foundCount++;
-            break;
-          }
-        }
-      }
-    }
-
-    // ── Reddit extraction
-    if (url.includes('reddit.com/r/')) {
-      try {
-        const jsonUrl = url.split('?')[0].replace(/\/+$/, '') + '.json';
-        const rRes = await fetch(jsonUrl, { headers: { 'User-Agent': 'Mozilla/5.0' } });
-        const rData = await rRes.json();
-        const post = rData?.[0]?.data?.children?.[0]?.data;
-        if (post) {
-          const vidObj = post.secure_media?.reddit_video || post.media?.reddit_video;
-          if (vidObj?.fallback_url) {
-            storeManualItem(targetTabId, {
-              url:       vidObj.fallback_url,
-              type:      'video',
-              mime:      'video/mp4',
-              size:      0,
-              title:     post.title || pageTitle || 'Reddit Video',
-              poster:    post.thumbnail || posterUrl,
-              quality:   vidObj.height ? `${vidObj.height}p` : 'HD',
-              platform:  'Reddit',
-              isStream:  false,
-              isManual:  true,
-              timestamp: Date.now(),
-            });
-            foundCount++;
-          }
-        }
-      } catch {}
-    }
-
-    // ── TikTok extraction
-    if (url.includes('tiktok.com')) {
-      const ttMatches = html.match(/"playAddr"\s*:\s*"([^"]+)"/) ||
-                        html.match(/"downloadAddr"\s*:\s*"([^"]+)"/);
-      if (ttMatches && ttMatches[1]) {
-        const ttUrl = unescapeJson(ttMatches[1]);
-        if (ttUrl.startsWith('http')) {
-          storeManualItem(targetTabId, {
-            url:       ttUrl,
-            type:      'video',
-            mime:      'video/mp4',
-            size:      0,
-            title:     pageTitle || 'TikTok Video',
-            poster:    posterUrl,
-            quality:   'HD',
-            platform:  'TikTok',
-            isStream:  false,
-            isManual:  true,
-            timestamp: Date.now(),
-          });
-          foundCount++;
-        }
-      }
-    }
-
-    // ── OpenGraph & Twitter Video meta tags
-    const ogVideoMatch = html.match(/<meta\s+property=["']og:video(?::secure_url|:url)?["']\s+content=["']([^"']+)["']/i) ||
-                         html.match(/<meta\s+(?:name|property)=["']twitter:player:stream["']\s+content=["']([^"']+)["']/i);
-    if (ogVideoMatch && ogVideoMatch[1]) {
-      const ogVidUrl = ogVideoMatch[1].replace(/&amp;/g, '&');
-      if (ogVidUrl.startsWith('http') && !isWebPageUrl(ogVidUrl)) {
-        storeManualItem(targetTabId, {
-          url:       ogVidUrl,
-          type:      'video',
-          mime:      'video/mp4',
-          size:      0,
-          title:     pageTitle || 'Video File',
-          poster:    posterUrl,
-          quality:   'Original',
-          platform:  extractPlatform(ogVidUrl) || extractPlatform(url),
-          isStream:  ogVidUrl.includes('.m3u8'),
-          isManual:  true,
-          timestamp: Date.now(),
-        });
-        foundCount++;
-      }
-    }
-
-    // ── HTML5 <video> and <source> tag extraction
-    const srcRegex = /<(?:video|source)[^>]+src=["']([^"']+\.(?:mp4|webm|mkv|mov|m3u8|mpd)[^"']*)["']/gi;
-    let sMatch;
-    while ((sMatch = srcRegex.exec(html)) !== null) {
-      let vSrc = sMatch[1];
-      if (vSrc.startsWith('//')) vSrc = 'https:' + vSrc;
-      else if (vSrc.startsWith('/')) {
-        try { vSrc = new URL(url).origin + vSrc; } catch {}
-      }
-      if (vSrc.startsWith('http') && !isWebPageUrl(vSrc)) {
-        storeManualItem(targetTabId, {
-          url:       vSrc,
-          type:      'video',
-          mime:      'video/mp4',
-          size:      0,
-          title:     pageTitle || 'Video Stream',
-          poster:    posterUrl,
-          quality:   getQualityTag(vSrc, '', 'video') || '',
-          platform:  extractPlatform(vSrc) || extractPlatform(url),
-          isStream:  vSrc.includes('.m3u8'),
-          isManual:  true,
-          timestamp: Date.now(),
-        });
-        foundCount++;
-      }
-    }
-
-    // ── Generic fallback regex for media CDN URLs inside scripts/JSON
-    if (foundCount === 0) {
-      const cdnRegex = /https?:\\\/\\\/[^"'\s<>]+\.(?:mp4|webm|m3u8)(?:\\\/[^"'\s<>]*)?/gi;
-      const cdnMatches = html.match(cdnRegex);
-      if (cdnMatches) {
-        for (const rawCdn of cdnMatches.slice(0, 3)) {
-          const decUrl = unescapeJson(rawCdn);
-          if (decUrl.startsWith('http') && !isWebPageUrl(decUrl)) {
-            storeManualItem(targetTabId, {
-              url:       decUrl,
-              type:      'video',
-              mime:      'video/mp4',
-              size:      0,
-              title:     pageTitle || 'Detected Video',
-              poster:    posterUrl,
-              quality:   '',
-              platform:  extractPlatform(decUrl) || extractPlatform(url),
-              isStream:  decUrl.includes('.m3u8'),
-              isManual:  true,
-              timestamp: Date.now(),
-            });
-            foundCount++;
-          }
-        }
-      }
-    }
-
-    // If YouTube link
-    if (foundCount === 0 && (url.includes('youtube.com') || url.includes('youtu.be'))) {
-      let vidId = '';
-      try {
-        const u = new URL(url);
-        vidId = u.searchParams.get('v') || u.pathname.split('/').pop();
-      } catch {}
-      if (vidId) {
-        posterUrl = `https://i.ytimg.com/vi/${vidId}/hqdefault.jpg`;
-        // We add an informative item with yt-dlp copy capability
-        storeManualItem(targetTabId, {
-          url:       `https://www.youtube.com/watch?v=${vidId}`,
-          type:      'video',
-          mime:      'video/mp4',
-          size:      0,
-          title:     pageTitle || `YouTube Video (${vidId})`,
-          poster:    posterUrl,
-          quality:   'YouTube Stream',
-          platform:  'YouTube',
-          isStream:  true,
-          isManual:  true,
-          timestamp: Date.now(),
-        });
-        foundCount++;
-      }
-    }
-
-    return { success: foundCount > 0, count: foundCount };
   } catch (err) {
-    console.error('Error fetching pasted URL:', err);
-    return { success: false, count: 0 };
+    console.error('Third-party API extraction failed:', err);
   }
+
+  return { success: false, count: 0 };
 }
 
 // ─── Tab / Navigation Lifecycle (Current Session Scoping) ─────────────────────
