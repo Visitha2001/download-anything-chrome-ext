@@ -133,6 +133,9 @@ function getBestVideoSrc(v) {
     if (val && val.startsWith('http') && !isPageUrl(val)) return val;
   }
 
+  return '';
+}
+
 function getPageVideoElements() {
   const vids = Array.from(document.querySelectorAll('video'));
   try {
@@ -149,12 +152,44 @@ function getPageVideoElements() {
   return vids;
 }
 
+let currentHref = location.href;
+let extractedDeepMedia = false;
+
 // ─── Media Scanner ───────────────────────────────────────────────────────────
 function findMediaElements() {
+  if (currentHref !== location.href) {
+    currentHref = location.href;
+    extractedDeepMedia = false;
+  }
+
   const meta   = getPageMetadata();
   const videos = [];
   const images = [];
   const docs   = [];
+  
+  if (meta.platform === 'Facebook' && !extractedDeepMedia) {
+    extractedDeepMedia = true;
+    const html = document.documentElement.innerHTML;
+    const fbVideoRegexes = [
+      /"browser_native_hd_url"\s*:\s*"([^"]+)"/g,
+      /"browser_native_sd_url"\s*:\s*"([^"]+)"/g,
+      /"playable_url_quality_hd"\s*:\s*"([^"]+)"/g,
+      /"playable_url"\s*:\s*"([^"]+)"/g,
+    ];
+    for (const rx of fbVideoRegexes) {
+      let m;
+      while ((m = rx.exec(html)) !== null) {
+        if (m && m[1]) {
+          let rawMediaUrl = m[1];
+          try { rawMediaUrl = JSON.parse(`"${m[1]}"`); }
+          catch { rawMediaUrl = m[1].replace(/\\\//g, '/').replace(/\\u0026/g, '&'); }
+          if (rawMediaUrl.startsWith('http') && !isPageUrl(rawMediaUrl)) {
+             videos.push({ url: rawMediaUrl, poster: meta.poster, title: meta.title, quality: 'Direct' });
+          }
+        }
+      }
+    }
+  }
 
   // 1. <video> elements
   getPageVideoElements().forEach(v => {
@@ -173,11 +208,11 @@ function findMediaElements() {
     videos.push({ url: ogVid, poster: meta.poster, title: meta.title, quality: 'Original' });
   }
 
-  // 3. <img> elements — content images (≥ 250×250)
+  // 3. <img> elements — full content images (≥ 350×350)
   document.querySelectorAll('img').forEach(img => {
     const w = img.naturalWidth  || img.width  || 0;
     const h = img.naturalHeight || img.height || 0;
-    if (w >= 250 && h >= 250 && img.src && img.src.startsWith('http') && !img.src.includes('data:')) {
+    if (w >= 350 && h >= 350 && img.src && img.src.startsWith('http') && !img.src.includes('data:')) {
       images.push({ url: img.src, title: meta.title });
     }
   });
@@ -219,31 +254,50 @@ function findMediaElements() {
       action: 'domMediaDetected',
       videos, images, docs, streams: [],
       metadata: meta,
+      pageUrl: location.href
     }, () => { if (chrome.runtime.lastError) {} });
   } catch {}
 }
 
-// ─── Boot ─────────────────────────────────────────────────────────────────────
+// ─── Boot & High-Speed Event Listeners ─────────────────────────────────────────
 findMediaElements();
 
-// Debounced MutationObserver
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', findMediaElements);
+}
+window.addEventListener('load', findMediaElements);
+
+// Rapid 200ms debounced MutationObserver for dynamic DOM injections
 let scanTimer = null;
 const observer = new MutationObserver(() => {
   clearTimeout(scanTimer);
-  scanTimer = setTimeout(findMediaElements, 1500);
+  scanTimer = setTimeout(findMediaElements, 200);
 });
 
 if (document.body) {
   observer.observe(document.body, { childList: true, subtree: true });
 } else {
   document.addEventListener('DOMContentLoaded', () => {
-    observer.observe(document.body, { childList: true, subtree: true });
+    if (document.body) {
+      observer.observe(document.body, { childList: true, subtree: true });
+    }
   });
 }
 
-// Re-scan listener
+// Instant detection when any video/audio starts loading or playing
+const mediaEvents = ['play', 'playing', 'loadstart', 'loadeddata', 'canplay'];
+mediaEvents.forEach(evt => {
+  document.addEventListener(evt, (e) => {
+    if (e.target && (e.target.tagName === 'VIDEO' || e.target.tagName === 'AUDIO')) {
+      clearTimeout(scanTimer);
+      scanTimer = setTimeout(findMediaElements, 60);
+    }
+  }, true);
+});
+
+// Immediate re-scan listener when requested by popup
 chrome.runtime.onMessage.addListener((req) => {
   if (req.action === 'rescanMedia') {
-    setTimeout(findMediaElements, 50);
+    findMediaElements();
   }
 });

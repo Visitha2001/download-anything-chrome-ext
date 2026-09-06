@@ -4,6 +4,52 @@ let tabMetadata   = {};   // tabId → { title, poster, platform }
 let manualScans   = {};   // backgroundTabId → targetTabId
 let hlsManifests  = {};   // tabId → Set of seen m3u8 base URLs
 let seenUrls      = {};   // tabId → Set of normalized URLs
+let tabCurrentUrls= {};   // tabId → last known URL
+let currentSessionId = '';
+let storageSaveTimers = {};
+
+// ─── Session Management ───────────────────────────────────────────────────────
+// Strictly isolate media to the current browser/page session
+function initSession() {
+  chrome.storage.session.get('sessionId', (data) => {
+    if (!data || !data.sessionId) {
+      currentSessionId = 'sess_' + Date.now() + '_' + Math.random().toString(36).slice(2);
+      chrome.storage.session.set({ sessionId: currentSessionId });
+      // Fresh browser run: clear old persisted media from previous sessions
+      chrome.storage.local.clear();
+      detectedMedia = {};
+      seenUrls = {};
+      hlsManifests = {};
+      tabMetadata = {};
+      tabCurrentUrls = {};
+    } else {
+      currentSessionId = data.sessionId;
+    }
+  });
+}
+initSession();
+
+chrome.runtime.onStartup.addListener(() => {
+  currentSessionId = 'sess_' + Date.now() + '_' + Math.random().toString(36).slice(2);
+  chrome.storage.session.set({ sessionId: currentSessionId });
+  chrome.storage.local.clear();
+  detectedMedia = {};
+  seenUrls = {};
+  hlsManifests = {};
+  tabMetadata = {};
+  tabCurrentUrls = {};
+});
+
+chrome.runtime.onInstalled.addListener(() => {
+  currentSessionId = 'sess_' + Date.now() + '_' + Math.random().toString(36).slice(2);
+  chrome.storage.session.set({ sessionId: currentSessionId });
+  chrome.storage.local.clear();
+  detectedMedia = {};
+  seenUrls = {};
+  hlsManifests = {};
+  tabMetadata = {};
+  tabCurrentUrls = {};
+});
 
 // ─── MIME & Regex Classifiers ────────────────────────────────────────────────
 const VIDEO_MIME = new Set([
@@ -11,10 +57,12 @@ const VIDEO_MIME = new Set([
   'video/quicktime', 'video/x-flv', 'video/x-ms-wmv', 'video/x-msvideo',
   'video/3gpp', 'video/3gpp2', 'video/mp2t', 'video/mpeg', 'video/iso.segment',
   'application/x-mpegurl', 'application/vnd.apple.mpegurl',
-  'application/dash+xml', 'application/octet-stream',
+  'application/dash+xml',
 ]);
 
-const IMAGE_MIME_PREFIX = 'image/';
+const VALID_IMAGE_MIME = new Set([
+  'image/jpeg', 'image/jpg', 'image/png', 'image/webp', 'image/gif', 'image/avif', 'image/svg+xml'
+]);
 const PDF_MIME          = 'application/pdf';
 
 const VIDEO_URL_PATTERNS = [
@@ -34,7 +82,7 @@ const VIDEO_URL_PATTERNS = [
   /storage\.googleapis\.com.*\.mp4/,
 ];
 
-// URLs that are clearly web pages and must NEVER be treated as downloadable video files
+// URLs that are clearly web pages or API endpoints and must NEVER be treated as media files
 const PAGE_URL_PATTERNS = [
   /^https?:\/\/(www\.|web\.|m\.)?facebook\.com\/(reel|watch|video|videos|story)/i,
   /^https?:\/\/(www\.)?youtube\.com\/(watch|shorts|channel|user)/i,
@@ -45,6 +93,10 @@ const PAGE_URL_PATTERNS = [
   /^https?:\/\/(www\.)?reddit\.com\/r\/[^/]+\/comments\//i,
   /\.html?(\?|$)/i,
   /\.php(\?|$)/i,
+  /\/ajax\//i,
+  /\/api\/graphql/i,
+  /\/bz\?/i,
+  /facebook\.com\/tr\//i,
 ];
 
 function isWebPageUrl(url) {
@@ -65,14 +117,8 @@ function normalizeUrl(url) {
 }
 
 function cleanFacebookVideoUrl(url) {
-  try {
-    const u = new URL(url);
-    u.searchParams.delete('bytestart');
-    u.searchParams.delete('byteend');
-    return u.toString();
-  } catch {
-    return url;
-  }
+  // Never tamper with signed query strings (oh, oe, bytestart, efg) to avoid 403 Forbidden
+  return url;
 }
 
 function matchesVideoUrl(url) {
@@ -81,9 +127,10 @@ function matchesVideoUrl(url) {
 
 function classifyUrl(url, contentType) {
   if (isWebPageUrl(url)) return null;
+  if (url.includes('keyframes') || (contentType && contentType.includes('keyframes'))) return null;
   const ct = (contentType || '').toLowerCase().split(';')[0].trim();
   if (ct && VIDEO_MIME.has(ct)) return 'video';
-  if (ct && ct.startsWith(IMAGE_MIME_PREFIX)) return 'image';
+  if (ct && VALID_IMAGE_MIME.has(ct)) return 'image';
   if (ct === PDF_MIME) return 'pdf';
   if (matchesVideoUrl(url)) return 'video';
   return null;
@@ -119,7 +166,8 @@ function extractPlatform(url) {
   return '';
 }
 
-function getQualityTag(url, contentType) {
+function getQualityTag(url, contentType, mediaType) {
+  if (mediaType !== 'video') return '';
   try {
     const u = new URL(url);
     const itag = u.searchParams.get('itag');
@@ -140,7 +188,7 @@ function getQualityTag(url, contentType) {
   if (/480[p_]/i.test(url))  return '480p';
   if (/360[p_]/i.test(url))  return '360p';
   if (/240[p_]/i.test(url))  return '240p';
-  if (url.includes('fbcdn.net')) return 'HD Video';
+  if (url.includes('fbcdn.net') && (url.includes('.mp4') || (contentType && contentType.includes('video')))) return 'HD Video';
   return '';
 }
 
@@ -150,9 +198,20 @@ function ensureTabState(tabId) {
   if (!hlsManifests[tabId])  hlsManifests[tabId]  = new Set();
 }
 
+function scheduleStorageSave(tabId) {
+  if (storageSaveTimers[tabId]) return;
+  storageSaveTimers[tabId] = setTimeout(() => {
+    delete storageSaveTimers[tabId];
+    if (detectedMedia[tabId]) {
+      chrome.storage.local.set({ ['media_' + tabId]: detectedMedia[tabId] });
+    }
+  }, 25);
+}
+
 function storeItem(tabId, item) {
   if (!item || !item.url) return;
-  // STRICT GUARD: Never store web page URLs as video or image items
+  // STRICT GUARD: Block keyframes animation data and web page URLs
+  if (item.url.includes('keyframes') || (item.mime && item.mime.includes('keyframes'))) return;
   if (isWebPageUrl(item.url) || item.quality === 'page-link') return;
 
   ensureTabState(tabId);
@@ -160,8 +219,9 @@ function storeItem(tabId, item) {
   if (seenUrls[tabId].has(key)) return;
   seenUrls[tabId].add(key);
 
+  item.sessionId = currentSessionId;
   detectedMedia[tabId].push(item);
-  chrome.storage.local.set({ ['media_' + tabId]: detectedMedia[tabId] });
+  scheduleStorageSave(tabId);
 
   // Mirror to manual-scan origin tab if this came from a background scan
   const targetTabId = manualScans[tabId];
@@ -170,9 +230,9 @@ function storeItem(tabId, item) {
     const mirrorKey = normalizeUrl(item.url);
     if (!seenUrls[targetTabId].has(mirrorKey)) {
       seenUrls[targetTabId].add(mirrorKey);
-      const copy = { ...item, title: (item.title ? '[Detected] ' + item.title : 'Detected Video') };
+      const copy = { ...item, title: (item.title ? '[Detected] ' + item.title : 'Detected Video'), isManual: true, sessionId: currentSessionId };
       detectedMedia[targetTabId].push(copy);
-      chrome.storage.local.set({ ['media_' + targetTabId]: detectedMedia[targetTabId] });
+      scheduleStorageSave(targetTabId);
     }
   }
 }
@@ -211,8 +271,8 @@ chrome.webRequest.onHeadersReceived.addListener(
       }
     }
 
-    // Skip tiny images/icons (< 15KB)
-    if (mediaType === 'image' && totalSize > 0 && totalSize < 15000) return;
+    // Skip tiny images under 2KB (2,048 bytes) to avoid tracking pixels, but keep thumbnails
+    if (mediaType === 'image' && totalSize > 0 && totalSize < 2048) return;
 
     // Filter rule: Only ignore videos if TOTAL size is confirmed < 1 MB
     // If it's a stream, or totalSize is 0/unknown, KEEP it!
@@ -253,7 +313,7 @@ chrome.webRequest.onHeadersReceived.addListener(
     }
 
     const meta    = tabMetadata[tabId] || {};
-    const quality = getQualityTag(details.url, contentType);
+    const quality = getQualityTag(details.url, contentType, mediaType);
 
     storeItem(tabId, {
       url:       finalUrl,
@@ -264,7 +324,8 @@ chrome.webRequest.onHeadersReceived.addListener(
       poster:    meta.poster || '',
       quality:   quality,
       platform:  extractPlatform(details.url),
-      isStream:  details.url.includes('googlevideo.com') || details.url.includes('.m3u8'),
+      isStream:  details.url.includes('googlevideo.com') || details.url.includes('.m3u8') || details.url.includes('bytestart='),
+      pageUrl:   tabCurrentUrls[tabId] || '',
       timestamp: Date.now(),
     });
   },
@@ -281,6 +342,9 @@ async function extractMediaFromPastedUrl(targetTabId, rawUrl) {
 
   ensureTabState(targetTabId);
 
+  // Wrapper: every manual item gets the original pasted URL for yt-dlp
+  const storeManualItem = (tabId, item) => storeItem(tabId, { ...item, pageUrl: url });
+
   // 1. Direct Video Link Check (e.g. .mp4, .webm, .m3u8)
   if (/\.(mp4|webm|mkv|mov|m3u8|mpd)(\?|$)/i.test(url)) {
     try {
@@ -294,16 +358,17 @@ async function extractMediaFromPastedUrl(targetTabId, rawUrl) {
           const u = new URL(url);
           title = decodeURIComponent(u.pathname.split('/').pop() || 'Video');
         } catch {}
-        storeItem(targetTabId, {
+        storeManualItem(targetTabId, {
           url:       url,
           type:      'video',
           mime:      ct || 'video/mp4',
           size:      cl,
           title:     title,
           poster:    '',
-          quality:   getQualityTag(url, ct) || 'Direct',
+          quality:   getQualityTag(url, ct, 'video') || 'Direct',
           platform:  extractPlatform(url),
           isStream:  url.includes('.m3u8'),
+          isManual:  true,
           timestamp: Date.now(),
         });
         return { success: true, count: 1 };
@@ -327,7 +392,7 @@ async function extractMediaFromPastedUrl(targetTabId, rawUrl) {
     // If server responded with a direct video stream
     if (contentType.startsWith('video/') || contentType.includes('mpegurl')) {
       const cl = parseInt(res.headers.get('content-length') || '0', 10);
-      storeItem(targetTabId, {
+      storeManualItem(targetTabId, {
         url:       url,
         type:      'video',
         mime:      contentType,
@@ -337,6 +402,7 @@ async function extractMediaFromPastedUrl(targetTabId, rawUrl) {
         quality:   'Stream',
         platform:  extractPlatform(url),
         isStream:  url.includes('.m3u8'),
+        isManual:  true,
         timestamp: Date.now(),
       });
       return { success: true, count: 1 };
@@ -345,10 +411,10 @@ async function extractMediaFromPastedUrl(targetTabId, rawUrl) {
     const html = await res.text();
     let foundCount = 0;
 
-    // Helper to unescape JSON strings
+    // Helper to unescape JSON strings without corrupting URL percent-encoding
     const unescapeJson = str => {
       try {
-        return decodeURIComponent(JSON.parse(`"${str}"`));
+        return JSON.parse(`"${str}"`);
       } catch {
         return str.replace(/\\\//g, '/').replace(/\\u0026/g, '&');
       }
@@ -382,7 +448,7 @@ async function extractMediaFromPastedUrl(targetTabId, rawUrl) {
           if (rawMediaUrl.startsWith('http') && !isWebPageUrl(rawMediaUrl)) {
             const cleanUrl = cleanFacebookVideoUrl(rawMediaUrl);
             const quality = rx.source.includes('hd') ? '1080p / HD' : 'SD';
-            storeItem(targetTabId, {
+            storeManualItem(targetTabId, {
               url:       cleanUrl,
               type:      'video',
               mime:      'video/mp4',
@@ -392,6 +458,7 @@ async function extractMediaFromPastedUrl(targetTabId, rawUrl) {
               quality:   quality,
               platform:  'Facebook',
               isStream:  false,
+              isManual:  true,
               timestamp: Date.now(),
             });
             foundCount++;
@@ -411,7 +478,7 @@ async function extractMediaFromPastedUrl(targetTabId, rawUrl) {
         if (post) {
           const vidObj = post.secure_media?.reddit_video || post.media?.reddit_video;
           if (vidObj?.fallback_url) {
-            storeItem(targetTabId, {
+            storeManualItem(targetTabId, {
               url:       vidObj.fallback_url,
               type:      'video',
               mime:      'video/mp4',
@@ -421,6 +488,7 @@ async function extractMediaFromPastedUrl(targetTabId, rawUrl) {
               quality:   vidObj.height ? `${vidObj.height}p` : 'HD',
               platform:  'Reddit',
               isStream:  false,
+              isManual:  true,
               timestamp: Date.now(),
             });
             foundCount++;
@@ -436,7 +504,7 @@ async function extractMediaFromPastedUrl(targetTabId, rawUrl) {
       if (ttMatches && ttMatches[1]) {
         const ttUrl = unescapeJson(ttMatches[1]);
         if (ttUrl.startsWith('http')) {
-          storeItem(targetTabId, {
+          storeManualItem(targetTabId, {
             url:       ttUrl,
             type:      'video',
             mime:      'video/mp4',
@@ -446,6 +514,7 @@ async function extractMediaFromPastedUrl(targetTabId, rawUrl) {
             quality:   'HD',
             platform:  'TikTok',
             isStream:  false,
+            isManual:  true,
             timestamp: Date.now(),
           });
           foundCount++;
@@ -459,7 +528,7 @@ async function extractMediaFromPastedUrl(targetTabId, rawUrl) {
     if (ogVideoMatch && ogVideoMatch[1]) {
       const ogVidUrl = ogVideoMatch[1].replace(/&amp;/g, '&');
       if (ogVidUrl.startsWith('http') && !isWebPageUrl(ogVidUrl)) {
-        storeItem(targetTabId, {
+        storeManualItem(targetTabId, {
           url:       ogVidUrl,
           type:      'video',
           mime:      'video/mp4',
@@ -469,6 +538,7 @@ async function extractMediaFromPastedUrl(targetTabId, rawUrl) {
           quality:   'Original',
           platform:  extractPlatform(ogVidUrl) || extractPlatform(url),
           isStream:  ogVidUrl.includes('.m3u8'),
+          isManual:  true,
           timestamp: Date.now(),
         });
         foundCount++;
@@ -485,16 +555,17 @@ async function extractMediaFromPastedUrl(targetTabId, rawUrl) {
         try { vSrc = new URL(url).origin + vSrc; } catch {}
       }
       if (vSrc.startsWith('http') && !isWebPageUrl(vSrc)) {
-        storeItem(targetTabId, {
+        storeManualItem(targetTabId, {
           url:       vSrc,
           type:      'video',
           mime:      'video/mp4',
           size:      0,
           title:     pageTitle || 'Video Stream',
           poster:    posterUrl,
-          quality:   getQualityTag(vSrc, '') || '',
+          quality:   getQualityTag(vSrc, '', 'video') || '',
           platform:  extractPlatform(vSrc) || extractPlatform(url),
           isStream:  vSrc.includes('.m3u8'),
+          isManual:  true,
           timestamp: Date.now(),
         });
         foundCount++;
@@ -509,7 +580,7 @@ async function extractMediaFromPastedUrl(targetTabId, rawUrl) {
         for (const rawCdn of cdnMatches.slice(0, 3)) {
           const decUrl = unescapeJson(rawCdn);
           if (decUrl.startsWith('http') && !isWebPageUrl(decUrl)) {
-            storeItem(targetTabId, {
+            storeManualItem(targetTabId, {
               url:       decUrl,
               type:      'video',
               mime:      'video/mp4',
@@ -519,6 +590,7 @@ async function extractMediaFromPastedUrl(targetTabId, rawUrl) {
               quality:   '',
               platform:  extractPlatform(decUrl) || extractPlatform(url),
               isStream:  decUrl.includes('.m3u8'),
+              isManual:  true,
               timestamp: Date.now(),
             });
             foundCount++;
@@ -537,7 +609,7 @@ async function extractMediaFromPastedUrl(targetTabId, rawUrl) {
       if (vidId) {
         posterUrl = `https://i.ytimg.com/vi/${vidId}/hqdefault.jpg`;
         // We add an informative item with yt-dlp copy capability
-        storeItem(targetTabId, {
+        storeManualItem(targetTabId, {
           url:       `https://www.youtube.com/watch?v=${vidId}`,
           type:      'video',
           mime:      'video/mp4',
@@ -547,6 +619,7 @@ async function extractMediaFromPastedUrl(targetTabId, rawUrl) {
           quality:   'YouTube Stream',
           platform:  'YouTube',
           isStream:  true,
+          isManual:  true,
           timestamp: Date.now(),
         });
         foundCount++;
@@ -560,24 +633,74 @@ async function extractMediaFromPastedUrl(targetTabId, rawUrl) {
   }
 }
 
-// ─── Tab / Navigation Lifecycle ───────────────────────────────────────────────
+// ─── Tab / Navigation Lifecycle (Current Session Scoping) ─────────────────────
+function isDifferentMediaPage(oldUrl, newUrl) {
+  if (!oldUrl || !newUrl || oldUrl === newUrl) return false;
+  try {
+    const u1 = new URL(oldUrl);
+    const u2 = new URL(newUrl);
+    if (u1.origin !== u2.origin) return true;
+    if (u1.pathname !== u2.pathname) return true;
+    if (u1.searchParams.get('v') !== u2.searchParams.get('v')) return true;
+    if (u1.searchParams.get('video_id') !== u2.searchParams.get('video_id')) return true;
+    return false;
+  } catch {
+    return oldUrl !== newUrl;
+  }
+}
+
+function resetTabMedia(tabId) {
+  detectedMedia[tabId] = [];
+  seenUrls[tabId]      = new Set();
+  hlsManifests[tabId]  = new Set();
+  delete tabMetadata[tabId];
+  if (storageSaveTimers[tabId]) {
+    clearTimeout(storageSaveTimers[tabId]);
+    delete storageSaveTimers[tabId];
+  }
+  chrome.storage.local.set({ ['media_' + tabId]: [] });
+}
+
 chrome.tabs.onRemoved.addListener(function(tabId) {
   delete detectedMedia[tabId];
   delete tabMetadata[tabId];
   delete manualScans[tabId];
   delete seenUrls[tabId];
   delete hlsManifests[tabId];
+  delete tabCurrentUrls[tabId];
+  if (storageSaveTimers[tabId]) {
+    clearTimeout(storageSaveTimers[tabId]);
+    delete storageSaveTimers[tabId];
+  }
   chrome.storage.local.remove('media_' + tabId);
 });
 
 chrome.webNavigation.onBeforeNavigate.addListener(function(details) {
   if (details.frameId === 0) {
+    resetTabMedia(details.tabId);
+    tabCurrentUrls[details.tabId] = details.url;
+  }
+});
+
+// Reset media on Single-Page-App URL transitions (e.g. YouTube next video, Facebook Reels scroll)
+chrome.webNavigation.onHistoryStateUpdated.addListener(function(details) {
+  if (details.frameId === 0) {
     const tabId = details.tabId;
-    detectedMedia[tabId] = [];
-    seenUrls[tabId]      = new Set();
-    hlsManifests[tabId]  = new Set();
-    delete tabMetadata[tabId];
-    chrome.storage.local.set({ ['media_' + tabId]: [] });
+    const lastUrl = tabCurrentUrls[tabId];
+    if (lastUrl && isDifferentMediaPage(lastUrl, details.url)) {
+      resetTabMedia(tabId);
+    }
+    tabCurrentUrls[tabId] = details.url;
+  }
+});
+
+chrome.tabs.onUpdated.addListener(function(tabId, changeInfo, tab) {
+  if (changeInfo.url) {
+    const lastUrl = tabCurrentUrls[tabId];
+    if (lastUrl && isDifferentMediaPage(lastUrl, changeInfo.url)) {
+      resetTabMedia(tabId);
+    }
+    tabCurrentUrls[tabId] = changeInfo.url;
   }
 });
 
@@ -608,7 +731,8 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
           title:     titleStr,
           quality:   qual,
           platform:  extractPlatform(urlStr),
-          isStream:  urlStr.includes('.m3u8') || urlStr.includes('.mpd') || urlStr.includes('googlevideo.com'),
+          isStream:  urlStr.includes('.m3u8') || urlStr.includes('.mpd') || urlStr.includes('googlevideo.com') || urlStr.includes('bytestart='),
+          pageUrl:   request.pageUrl || tabCurrentUrls[tabId] || '',
           timestamp: Date.now(),
         });
       });
@@ -629,17 +753,24 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     return true; // async sendResponse
   }
 
+  // ── Immediate in-memory media fetch for instant popup rendering
+  else if (request.action === 'getMedia') {
+    const tabId = request.tabId;
+    const items = (detectedMedia[tabId] || []).filter(m => !currentSessionId || m.sessionId === currentSessionId || !m.sessionId);
+    sendResponse({ media: items, sessionId: currentSessionId });
+    return false;
+  }
+
   // ── Open popup
   else if (request.action === 'openPopup') {
     if (chrome.action?.openPopup) chrome.action.openPopup().catch(() => {});
   }
 
   // ── Clear all media for current tab
-  else if (request.action === 'clearMedia' && sender.tab) {
-    const tabId = sender.tab.id;
-    detectedMedia[tabId] = [];
-    seenUrls[tabId]      = new Set();
-    hlsManifests[tabId]  = new Set();
-    chrome.storage.local.set({ ['media_' + tabId]: [] });
+  else if (request.action === 'clearMedia') {
+    const tabId = request.tabId || (sender.tab ? sender.tab.id : null);
+    if (tabId) {
+      resetTabMedia(tabId);
+    }
   }
 });

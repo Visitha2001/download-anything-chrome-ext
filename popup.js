@@ -1,5 +1,9 @@
-// ─── Tab Switcher ─────────────────────────────────────────────────────────────
+// ─── Instant Startup & Tab Switcher ──────────────────────────────────────────
+let activeTabId = null;
+let scanTimeout = null;
+
 document.addEventListener('DOMContentLoaded', () => {
+    // 1. Setup UI tabs instantly
     const tabs     = document.querySelectorAll('.tab-btn');
     const contents = document.querySelectorAll('.content');
 
@@ -13,45 +17,80 @@ document.addEventListener('DOMContentLoaded', () => {
         });
     });
 
-    // ── Initial load
-    chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
-        if (!tabs?.length) return;
-        const tabId = tabs[0].id;
-        chrome.storage.local.get('media_' + tabId, result => {
-            renderMedia(result['media_' + tabId] || []);
+    // 2. Load cached media immediately from background memory / storage (instant 0ms render)
+    chrome.tabs.query({ active: true, currentWindow: true }, (tabsList) => {
+        if (!tabsList?.length) return;
+        activeTabId = tabsList[0].id;
+
+        // Show immediate scanning indicator if no cached media is rendered yet
+        showScanningState();
+
+        // 2a. Query background RAM for instant sub-millisecond response
+        chrome.runtime.sendMessage({ action: 'getMedia', tabId: activeTabId }, (resp) => {
+            if (resp && Array.isArray(resp.media) && resp.media.length > 0) {
+                renderMedia(resp.media);
+            } else {
+                chrome.storage.local.get('media_' + activeTabId, result => {
+                    renderMedia(result['media_' + activeTabId] || []);
+                });
+            }
+
+            // 3. Trigger immediate rescan on the active page
+            chrome.tabs.sendMessage(activeTabId, { action: 'rescanMedia' }, () => {
+                if (chrome.runtime.lastError) { /* ignore tab error */ }
+            });
         });
     });
 
-    // ── Live updates from background
+    // 4. Listen for live updates from background / content scripts
     chrome.storage.onChanged.addListener((changes) => {
-        chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
-            if (!tabs?.length) return;
-            const key = 'media_' + tabs[0].id;
-            if (changes[key]) renderMedia(changes[key].newValue || []);
-        });
+        if (!activeTabId) return;
+        const key = 'media_' + activeTabId;
+        if (changes[key]) {
+            renderMedia(changes[key].newValue || []);
+        }
     });
 
-    // ── Refresh button
+    // 5. Refresh button
     const refreshBtn = document.getElementById('refresh-btn');
     if (refreshBtn) {
         refreshBtn.addEventListener('click', () => {
             refreshBtn.classList.add('spinning');
-            setTimeout(() => refreshBtn.classList.remove('spinning'), 800);
+            setTimeout(() => refreshBtn.classList.remove('spinning'), 600);
 
-            chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
-                if (!tabs?.length) return;
-                const tabId = tabs[0].id;
-                chrome.storage.local.get('media_' + tabId, result => {
-                    renderMedia(result['media_' + tabId] || []);
-                });
-                chrome.tabs.sendMessage(tabId, { action: 'rescanMedia' }, () => {
-                    if (chrome.runtime.lastError) { /* ignore */ }
-                });
+            if (!activeTabId) return;
+            showScanningState();
+            chrome.runtime.sendMessage({ action: 'getMedia', tabId: activeTabId }, (resp) => {
+                if (resp && Array.isArray(resp.media)) {
+                    renderMedia(resp.media);
+                } else {
+                    chrome.storage.local.get('media_' + activeTabId, result => {
+                        renderMedia(result['media_' + activeTabId] || []);
+                    });
+                }
+            });
+            chrome.tabs.sendMessage(activeTabId, { action: 'rescanMedia' }, () => {
+                if (chrome.runtime.lastError) { /* ignore */ }
             });
         });
     }
 
-    // ── Manual link input
+    // ── Clear All button
+    const clearBtn = document.getElementById('clear-btn');
+    if (clearBtn) {
+        clearBtn.addEventListener('click', () => {
+            if (!activeTabId) return;
+            clearBtn.classList.add('cleared');
+            setTimeout(() => clearBtn.classList.remove('cleared'), 500);
+            chrome.runtime.sendMessage({ action: 'clearMedia', tabId: activeTabId }, () => {
+                if (chrome.runtime.lastError) { /* ignore */ }
+            });
+            chrome.storage.local.set({ ['media_' + activeTabId]: [] });
+            renderMedia([]);
+        });
+    }
+
+    // 6. Manual link input
     const manualBtn   = document.getElementById('manual-add-btn');
     const manualInput = document.getElementById('manual-link-input');
     if (manualBtn && manualInput) {
@@ -63,15 +102,15 @@ document.addEventListener('DOMContentLoaded', () => {
             }
 
             manualBtn.disabled = true;
-            manualBtn.textContent = 'Scanning…';
+            manualBtn.innerHTML = '<span class="btn-spinner"></span> Scanning…';
 
-            chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
-                if (!tabs?.length) {
+            chrome.tabs.query({ active: true, currentWindow: true }, (tabsList) => {
+                if (!tabsList?.length) {
                     manualBtn.disabled = false;
                     manualBtn.textContent = 'Detect';
                     return;
                 }
-                const tabId = tabs[0].id;
+                const tabId = tabsList[0].id;
 
                 chrome.runtime.sendMessage({
                     action: 'processManualLink',
@@ -81,14 +120,12 @@ document.addEventListener('DOMContentLoaded', () => {
                     manualBtn.disabled = false;
                     if (response && response.count > 0) {
                         manualBtn.textContent = `Found ${response.count}!`;
-                        // Switch to Videos tab
                         const vidTabBtn = document.querySelector('.tab-btn[data-tab="videos"]');
                         if (vidTabBtn) vidTabBtn.click();
                     } else {
                         manualBtn.textContent = 'Done';
                     }
 
-                    // Reload storage
                     chrome.storage.local.get('media_' + tabId, result => {
                         renderMedia(result['media_' + tabId] || []);
                     });
@@ -128,15 +165,8 @@ function isStreamUrl(url) {
 }
 
 function getCleanDownloadUrl(url) {
-    try {
-        const u = new URL(url);
-        // Clean Facebook range limits so entire video is downloaded
-        u.searchParams.delete('bytestart');
-        u.searchParams.delete('byteend');
-        return u.toString();
-    } catch {
-        return url;
-    }
+    // Preserve signed URL parameters to prevent HMAC signature invalidation
+    return url;
 }
 
 function getCleanFilename(item) {
@@ -185,13 +215,33 @@ function copyToClipboard(text) {
     });
 }
 
-// ─── Render ───────────────────────────────────────────────────────────────────
+function showScanningState() {
+    const videoList = document.getElementById('video-list');
+    if (videoList && (!videoList.children.length || videoList.querySelector('.empty-state'))) {
+        videoList.innerHTML = `<li class="scanning-state"><div class="spinner-ring"></div> Scanning for media on page…</li>`;
+        clearTimeout(scanTimeout);
+        scanTimeout = setTimeout(() => {
+            const sc = videoList.querySelector('.scanning-state');
+            if (sc) {
+                videoList.innerHTML = `<li class="empty-state">No videos detected yet. Play a video to detect it.</li>`;
+            }
+        }, 1200);
+    }
+}
+
+// ─── High-Performance Batch Render ────────────────────────────────────────────
 function renderMedia(mediaArray) {
-    // Only filter out confirmed non-stream videos with known size < 1MB
+    clearTimeout(scanTimeout);
+
     const videos = mediaArray.filter(m =>
         m.type === 'video' && !(m.size > 0 && m.size < 1048576 && !m.isStream)
     );
-    const images = mediaArray.filter(m => m.type === 'image');
+    const images = mediaArray.filter(m =>
+        m.type === 'image' &&
+        !(m.size > 0 && m.size < 2048) &&
+        !((m.mime || '').includes('keyframes')) &&
+        !((m.url || '').includes('keyframes'))
+    );
     const docs   = mediaArray.filter(m => m.type === 'pdf');
 
     setCount('video-count', videos.length);
@@ -211,6 +261,7 @@ function setCount(id, n) {
 function renderList(listId, items, label) {
     const ul = document.getElementById(listId);
     if (!ul) return;
+
     if (!items.length) {
         ul.innerHTML = `<li class="empty-state">No ${label} detected yet.</li>`;
         return;
@@ -219,9 +270,15 @@ function renderList(listId, items, label) {
     ul.innerHTML = '';
     items.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
 
+    // Use DocumentFragment for 1-pass fast rendering
+    const fragment = document.createDocumentFragment();
+
     items.forEach(item => {
         const li = document.createElement('li');
         li.className = 'media-item';
+        if (item.isManual) {
+            li.classList.add('manual-item');
+        }
 
         // ── Thumbnail / preview
         const preview = document.createElement('div');
@@ -230,16 +287,44 @@ function renderList(listId, items, label) {
         if (item.type === 'pdf') {
             preview.textContent = '📄';
         } else if (item.type === 'image') {
+            const spinner = document.createElement('div');
+            spinner.className = 'preview-spinner';
+            preview.appendChild(spinner);
+
             const img = document.createElement('img');
-            img.src     = item.url;
-            img.onerror = () => { preview.textContent = '🖼️'; };
+            img.className = 'preview-img loading';
+            img.src       = item.url;
+            img.onload = () => {
+                spinner.remove();
+                img.classList.remove('loading');
+                img.classList.add('loaded');
+            };
+            img.onerror = () => {
+                spinner.remove();
+                img.remove();
+                preview.textContent = '🖼️';
+            };
             preview.appendChild(img);
         } else {
             // Video preview
             if (item.poster) {
+                const spinner = document.createElement('div');
+                spinner.className = 'preview-spinner';
+                preview.appendChild(spinner);
+
                 const img = document.createElement('img');
-                img.src     = item.poster;
-                img.onerror = () => { preview.textContent = '🎥'; };
+                img.className = 'preview-img loading';
+                img.src       = item.poster;
+                img.onload = () => {
+                    spinner.remove();
+                    img.classList.remove('loading');
+                    img.classList.add('loaded');
+                };
+                img.onerror = () => {
+                    spinner.remove();
+                    img.remove();
+                    preview.textContent = '🎥';
+                };
                 preview.appendChild(img);
             } else {
                 preview.textContent = '🎥';
@@ -265,10 +350,13 @@ function renderList(listId, items, label) {
         const metaEl = document.createElement('div');
         metaEl.className = 'media-meta';
         const parts = [];
+        if (item.isManual) {
+            parts.push('<span class="manual-badge">⚡ Manual</span>');
+        }
         if (item.mime && item.mime !== 'unknown') parts.push(item.mime);
         if (item.quality) parts.push(item.quality);
         if (item.size)    parts.push(formatBytes(item.size));
-        metaEl.textContent = parts.length ? parts.join(' • ') : 'Ready to download';
+        metaEl.innerHTML = parts.length ? parts.join(' • ') : 'Ready to download';
 
         info.appendChild(titleEl);
         info.appendChild(metaEl);
@@ -286,63 +374,81 @@ function renderList(listId, items, label) {
         const actions = document.createElement('div');
         actions.className = 'item-actions';
 
-        const dlBtn = document.createElement('button');
-        dlBtn.className   = 'download-btn';
-        dlBtn.textContent = '⬇ Download';
-        dlBtn.onclick = () => {
-            if (isWebPageUrl(item.url)) {
-                alert('This is a web page link, not a direct video stream. Play the video on the page to capture the direct stream.');
-                return;
-            }
-            const cleanUrl  = getCleanDownloadUrl(item.url);
-            const safeTitle = getCleanFilename(item);
-            chrome.downloads.download({
-                url: cleanUrl,
-                filename: safeTitle,
-                saveAs: false,
-            }, (downloadId) => {
-                if (chrome.runtime.lastError) {
-                    // Fallback to simple download if filename conflict occurs
-                    chrome.downloads.download({ url: cleanUrl });
-                }
-            });
-        };
-
         const copyBtn = document.createElement('button');
         copyBtn.className   = 'copy-btn';
         copyBtn.title       = 'Copy URL';
         copyBtn.textContent = '📋';
+        // For manual social items, copy the original page URL (CDN URLs are auth-gated and useless)
+        const copyUrl = (item.isManual && item.pageUrl) ? item.pageUrl : item.url;
         copyBtn.onclick = () => {
-            copyToClipboard(item.url);
+            copyToClipboard(copyUrl);
             copyBtn.textContent = '✅';
             setTimeout(() => { copyBtn.textContent = '📋'; }, 1500);
         };
 
-        // yt-dlp button for streams / YouTube
-        if (item.isStream || isStreamUrl(item.url) || item.platform === 'YouTube') {
+        // Manual items from social platforms have CDN URLs that require auth cookies
+        // the extension doesn't have — direct downloads always fail (saves .txt garbage)
+        const AUTH_PLATFORMS = new Set(['YouTube', 'Facebook', 'Instagram', 'TikTok', 'Twitter/X', 'Twitch']);
+        const needsYtdlp = item.isStream
+            || item.url.includes('.m3u8')
+            || item.url.includes('bytestart=')
+            || item.platform === 'YouTube'
+            || item.url.includes('youtube.com')
+            || isWebPageUrl(item.url)
+            || (item.isManual && AUTH_PLATFORMS.has(item.platform));
+        const canDownload = !needsYtdlp;
+
+        if (canDownload) {
+            const dlBtn = document.createElement('button');
+            dlBtn.className   = 'download-btn';
+            dlBtn.textContent = '⬇ Download';
+            dlBtn.onclick = () => {
+                const cleanUrl  = getCleanDownloadUrl(item.url);
+                const safeTitle = getCleanFilename(item);
+                chrome.downloads.download({
+                    url: cleanUrl,
+                    filename: safeTitle,
+                    saveAs: false,
+                }, () => {
+                    if (chrome.runtime.lastError) {
+                        chrome.downloads.download({ url: cleanUrl });
+                    }
+                });
+            };
+            actions.appendChild(copyBtn);
+            actions.appendChild(dlBtn);
+        } else {
             const ytBtn = document.createElement('button');
             ytBtn.className   = 'ytdlp-btn';
             ytBtn.title       = 'Copy yt-dlp command to clipboard';
-            ytBtn.textContent = 'yt-dlp';
+            ytBtn.textContent = 'yt-dlp Command';
             ytBtn.onclick = () => {
-                const targetUrl = item.url.includes('googlevideo.com')
-                    ? location.href
-                    : item.url;
+                const targetUrl = item.pageUrl || item.url;
                 copyToClipboard(`yt-dlp "${targetUrl}"`);
                 ytBtn.textContent = 'Copied!';
-                setTimeout(() => { ytBtn.textContent = 'yt-dlp'; }, 1800);
+                setTimeout(() => { ytBtn.textContent = 'yt-dlp Command'; }, 1800);
             };
-            actions.appendChild(ytBtn);
-        }
 
-        actions.appendChild(copyBtn);
-        actions.appendChild(dlBtn);
+            const infoBtn = document.createElement('button');
+            infoBtn.className = 'download-btn';
+            infoBtn.style.backgroundColor = '#6b7280'; // gray
+            infoBtn.textContent = '❓ Why yt-dlp?';
+            infoBtn.onclick = () => {
+                alert('This video uses adaptive streaming (like YouTube) which splits audio and video, or it is a protected stream. It cannot be downloaded directly via the browser. Please install yt-dlp on your computer and use the copied command to download it.');
+            };
+
+            actions.appendChild(copyBtn);
+            actions.appendChild(ytBtn);
+            actions.appendChild(infoBtn);
+        }
 
         wrapper.appendChild(info);
         wrapper.appendChild(actions);
 
         li.appendChild(preview);
         li.appendChild(wrapper);
-        ul.appendChild(li);
+        fragment.appendChild(li);
     });
+
+    ul.appendChild(fragment);
 }
